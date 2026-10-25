@@ -3,6 +3,7 @@ import Foundation
 @preconcurrency import GameController
 import UIKit
 import SwiftUI
+import CoreBluetooth
 
 /// ml1930: physical and touch controller snapshots share the same serial publisher.
 /// Slot/profile/timer state belongs exclusively to `queue`. The app lifecycle
@@ -155,6 +156,21 @@ final class GamepadInput: @unchecked Sendable {
         queue.async { [self] in
             guard active || value == nil else { return }
             touchState.update(owner: owner, control: control, value: value)
+            sample()
+        }
+    }
+
+    /// Steam Controller mode (SteamControllerBLE): the pad's latest state, read
+    /// over Bluetooth LE because iOS does not offer it as a GameController; it is
+    /// player 1 when no GameController pad holds slot 0. nil while none is
+    /// connected or the mode is off. Queue-owned.
+    private var steamPad: GamepadSample?
+
+    /// SteamControllerBLE's callback queue: publish a new state (nil: gone).
+    func setSteamPad(_ value: GamepadSample?) {
+        queue.async { [self] in
+            guard steamPad != value else { return }
+            steamPad = value
             sample()
         }
     }
@@ -318,7 +334,8 @@ final class GamepadInput: @unchecked Sendable {
                 PadKeyboardMouse.shared.releaseAll("controller disconnected")
             }
             let hid = i == 0 && hidActive
-            guard pad != nil || touchConnected else {
+            let steam = i == 0 && pad == nil ? steamPad : nil
+            guard pad != nil || steam != nil || touchConnected else {
                 winios_gamepad_set_state(Int32(i), nil)
                 if hid { winios_hidpad_set_state(nil) }
                 continue
@@ -330,7 +347,9 @@ final class GamepadInput: @unchecked Sendable {
             var hidLive: GCExtendedGamepad?
             // Keep the connected identity, but release all controls while the
             // app is inactive. A delayed callback cannot republish a held key.
+            var physical = false
             if active, let pad {
+                physical = true
                 hidLive = hid ? pad : nil
                 let buttons: [(GCControllerButtonInput?, UInt16)] = [
                     (pad.dpad.up, 0x0001), (pad.dpad.down, 0x0002),
@@ -348,6 +367,13 @@ final class GamepadInput: @unchecked Sendable {
                 state.ly = Self.axis(pad.leftThumbstick.yAxis.value)
                 state.rx = Self.axis(pad.rightThumbstick.xAxis.value)
                 state.ry = Self.axis(pad.rightThumbstick.yAxis.value)
+            } else if active, let steam {
+                physical = true
+                state.buttons = steam.buttons
+                state.left_trigger = steam.lt; state.right_trigger = steam.rt
+                state.lx = steam.lx; state.ly = steam.ly; state.rx = steam.rx; state.ry = steam.ry
+            }
+            if physical {
                 // The library front end navigates with player 1's pad (Library.swift).
                 // While it owns input (no session, or its menu is open) the game
                 // sees a connected pad at rest.
@@ -452,5 +478,209 @@ enum GamepadEventClaim {
             interaction.handledEventTypes = .gamepad
             view.addInteraction(interaction)
         }
+    }
+}
+
+/// The Steam Controller (2026) as player 1 (LibraryEntry.controllerMode "steam").
+///
+/// iOS pairs it as a Bluetooth LE keyboard and mouse ("lizard mode": the D-pad
+/// types arrow keys) and never offers it to GameController, so GamepadInput
+/// cannot see it. This reads it the way SDL's iOS HIDAPI backend does
+/// (src/hidapi/ios/hid.m and src/joystick/hidapi/SDL_hidapi_steam_triton.c,
+/// zlib licence, Valve Corporation and the SDL authors): connect to the paired
+/// peripheral, subscribe to Valve's input characteristic, keep lizard mode off
+/// (the firmware turns it back on after a few seconds without the setting), and
+/// turn each Triton state report into an XInput sample for GamepadInput.
+///
+/// Reports (TritonMTUNoQuat_t, little endian, report ID not included): seq u8,
+/// buttons u32 @1, left/right trigger i16 @5/@7 (0...32767), left stick x/y
+/// @9/@11, right stick x/y @13/@15 (y up is positive). The 0x45 and 0x47
+/// variants agree up to the trackpads, so both are read the same way.
+final class SteamControllerBLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate, @unchecked Sendable {
+    static let shared = SteamControllerBLE()
+
+    private static let valveService = CBUUID(string: "100F6C32-1735-4313-B402-38567131E5F3")
+    private static let inputCharacteristics: Set<CBUUID> = [
+        CBUUID(string: "100F6C7A-1735-4313-B402-38567131E5F3"),   // report 0x45
+        CBUUID(string: "100F6C7C-1735-4313-B402-38567131E5F3"),   // report 0x47 (timestamped)
+    ]
+    private static let reportCharacteristic = CBUUID(string: "100F6C34-1735-4313-B402-38567131E5F3")
+    private static let deviceInformation = CBUUID(string: "180A")
+
+    /// Everything below belongs to `queue` (CoreBluetooth calls back on it).
+    private let queue = DispatchQueue(label: "madeira.steamcontroller", qos: .userInteractive)
+    private var central: CBCentralManager?
+    private var peripheral: CBPeripheral?
+    private var report: CBCharacteristic?
+    private var wanted = false
+    private var scanning = false
+    private var reports = 0
+    private var lizardTimer: DispatchSourceTimer?
+    private var retryTimer: DispatchSourceTimer?
+
+    /// The library session's choice: start reading the controller, or stop and
+    /// hand it back to iOS (lizard mode returns on its own once the setting stops).
+    func setWanted(_ value: Bool) {
+        queue.async { [self] in
+            guard wanted != value else { return }
+            wanted = value
+            LogStore.shared.log("[steam-pad] mode \(value ? "on" : "off")")
+            if value {
+                if central == nil { central = CBCentralManager(delegate: self, queue: queue) }
+                else { connectKnown() }
+                startRetry()
+            } else {
+                retryTimer?.cancel(); retryTimer = nil
+                stopLizardTimer()
+                if scanning { central?.stopScan(); scanning = false }
+                if let peripheral { central?.cancelPeripheralConnection(peripheral) }
+                peripheral = nil; report = nil
+                GamepadInput.shared.setSteamPad(nil)
+            }
+        }
+    }
+
+    // MARK: finding the controller
+
+    /// The controller is normally already connected to iOS (paired in Settings >
+    /// Bluetooth), so it is retrieved rather than discovered; a short scan covers
+    /// one that is advertising instead.
+    private func connectKnown() {
+        guard wanted, peripheral == nil, let central, central.state == .poweredOn else { return }
+        let known = central.retrieveConnectedPeripherals(withServices: [Self.deviceInformation, Self.valveService])
+        if let found = known.first(where: { ($0.name ?? "").hasPrefix("Steam") }) {
+            attach(found, why: "connected to iOS")
+            return
+        }
+        guard !scanning else { return }
+        scanning = true
+        central.scanForPeripherals(withServices: nil, options: nil)
+        LogStore.shared.log("[steam-pad] no connected Steam Controller; scanning 20 s")
+        queue.asyncAfter(deadline: .now() + 20) { [weak self] in
+            guard let self, self.scanning else { return }
+            self.central?.stopScan(); self.scanning = false
+        }
+    }
+
+    private func attach(_ found: CBPeripheral, why: String) {
+        if scanning { central?.stopScan(); scanning = false }
+        peripheral = found
+        found.delegate = self
+        LogStore.shared.log("[steam-pad] \(found.name ?? "?") \(why); connecting")
+        central?.connect(found, options: nil)
+    }
+
+    private func startRetry() {
+        guard retryTimer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + 5, repeating: 5)
+        t.setEventHandler { [weak self] in self?.connectKnown() }
+        retryTimer = t
+        t.resume()
+    }
+
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        switch central.state {
+        case .poweredOn: connectKnown()
+        case .unauthorized: LogStore.shared.log("[steam-pad] Bluetooth permission denied (Settings > Madeira > Bluetooth)")
+        case .poweredOff: LogStore.shared.log("[steam-pad] Bluetooth is off")
+        default: break
+        }
+    }
+
+    func centralManager(_ central: CBCentralManager, didDiscover found: CBPeripheral,
+                        advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        guard wanted, peripheral == nil, (found.name ?? "").hasPrefix("Steam") else { return }
+        attach(found, why: "found by scan")
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect connected: CBPeripheral) {
+        connected.discoverServices([Self.valveService])
+    }
+
+    func centralManager(_ central: CBCentralManager, didFailToConnect failed: CBPeripheral, error: Error?) {
+        LogStore.shared.log("[steam-pad] connect failed: \(error?.localizedDescription ?? "unknown")")
+        if failed === peripheral { peripheral = nil; report = nil }
+    }
+
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral gone: CBPeripheral, error: Error?) {
+        guard gone === peripheral else { return }
+        LogStore.shared.log("[steam-pad] disconnected after \(reports) reports")
+        peripheral = nil; report = nil; reports = 0
+        stopLizardTimer()
+        GamepadInput.shared.setSteamPad(nil)
+    }
+
+    // MARK: Valve's service
+
+    func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
+        guard let service = p.services?.first(where: { $0.uuid == Self.valveService }) else {
+            LogStore.shared.log("[steam-pad] Valve service not found (\(error?.localizedDescription ?? "no error"))")
+            return
+        }
+        p.discoverCharacteristics(nil, for: service)
+    }
+
+    func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        var inputs = 0
+        for c in service.characteristics ?? [] {
+            if Self.inputCharacteristics.contains(c.uuid) {
+                p.setNotifyValue(true, for: c)
+                inputs += 1
+            } else if c.uuid == Self.reportCharacteristic {
+                report = c
+            }
+        }
+        LogStore.shared.log("[steam-pad] Valve service: \(inputs) input characteristic(s), settings \(report != nil ? "yes" : "no")")
+        disableLizardMode()
+        startLizardTimer()
+    }
+
+    /// ID_SET_SETTINGS_VALUES (0x87), one setting: SETTING_LIZARD_MODE (9) =
+    /// LIZARD_MODE_OFF (0), padded to the 64-byte feature report.
+    private func disableLizardMode() {
+        guard let peripheral, let report else { return }
+        var bytes = [UInt8](repeating: 0, count: 64)
+        bytes[0] = 0x87; bytes[1] = 3; bytes[2] = 9; bytes[3] = 0; bytes[4] = 0
+        peripheral.writeValue(Data(bytes), for: report, type: .withResponse)
+    }
+
+    private func startLizardTimer() {
+        guard lizardTimer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + 3, repeating: 3)
+        t.setEventHandler { [weak self] in self?.disableLizardMode() }
+        lizardTimer = t
+        t.resume()
+    }
+
+    private func stopLizardTimer() { lizardTimer?.cancel(); lizardTimer = nil }
+
+    func peripheral(_ p: CBPeripheral, didUpdateValueFor c: CBCharacteristic, error: Error?) {
+        guard Self.inputCharacteristics.contains(c.uuid), let data = c.value, data.count >= 17 else { return }
+        reports += 1
+        if reports == 1 { LogStore.shared.log("[steam-pad] first report (\(data.count) bytes): player 1 is the Steam Controller") }
+        GamepadInput.shared.setSteamPad(Self.sample(data))
+    }
+
+    /// Triton state report -> XInput (wButtons bits as GamepadInput.sample sets them).
+    static func sample(_ d: Data) -> GamepadSample {
+        func u32(_ o: Int) -> UInt32 { d.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: o, as: UInt32.self) }.littleEndian }
+        func i16(_ o: Int) -> Int16 { d.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: o, as: Int16.self) }.littleEndian }
+        let b = u32(1)
+        let map: [(UInt32, UInt16)] = [
+            (0x0000_2000, 0x0001), (0x0000_0400, 0x0002), (0x0000_1000, 0x0004), (0x0000_0800, 0x0008), // D-pad
+            (0x0000_4000, 0x0010), (0x0000_0040, 0x0020),   // Menu -> START, View -> BACK
+            (0x0000_8000, 0x0040), (0x0000_0020, 0x0080),   // L3, R3
+            (0x0008_0000, 0x0100), (0x0000_0200, 0x0200),   // L, R bumpers
+            (0x0001_0000, 0x0400),                          // Steam -> guide
+            (0x0000_0001, 0x1000), (0x0000_0002, 0x2000), (0x0000_0004, 0x4000), (0x0000_0008, 0x8000), // A B X Y
+        ]
+        var s = GamepadSample()
+        for (bit, mask) in map where b & bit != 0 { s.buttons |= mask }
+        func trigger(_ v: Int16) -> UInt8 { UInt8((Int(max(0, v)) * 255 + 16383) / 32767) }
+        s.lt = trigger(i16(5)); s.rt = trigger(i16(7))
+        s.lx = i16(9); s.ly = i16(11); s.rx = i16(13); s.ry = i16(15)
+        return s
     }
 }

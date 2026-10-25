@@ -127,6 +127,12 @@ enum SteamLaunchScene: Equatable {
             // too; its title bar tells it from a splash screen or a tool strip.
             case .other where !installer && steam == nil && window.drawn && window.caption:
                 steam = window
+            // The same message box when its owner's executable could not be read: a
+            // titled window that drew is never a helper's (those live in C:\windows and
+            // are read), so it may need the user too. Without this, a game that failed
+            // before its first frame kept the starting screen up over its error box.
+            case .unknown where !installer && steam == nil && window.drawn && window.caption:
+                steam = window
             default: break
             }
         }

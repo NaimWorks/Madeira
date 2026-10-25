@@ -2652,6 +2652,7 @@ struct ContentView: View {
             // precision, frame limit).
             if let profile {
                 profile.applyEnvironment()
+                LuaJITGC64.prepare(profile)
                 // madeira-bcd: applyEnvironment sets or unsets AVX and "Report an NVIDIA
                 // GPU" from the entry's own fields; BCDLaunch.applyExtras exported the
                 // game's LibraryPrefs switches before, on the main thread (Game details

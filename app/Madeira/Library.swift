@@ -235,7 +235,9 @@ struct LibraryEntry: Codable, Identifiable {
     /// pad (for games older than XInput; a game reading both APIs sees two
     /// controllers); "keys", keyboard and mouse (PadKeyboardMouse: the pad
     /// presses keys and moves the mouse, the game sees no controller). For games
-    /// without controller support. Optional, so older files decode.
+    /// without controller support; "steam", a Steam Controller (2026) read over
+    /// Bluetooth LE (SteamControllerBLE) as player 1's XInput pad, since iOS
+    /// offers it only as a keyboard and mouse. Optional, so older files decode.
     var controllerMode: String?
     /// Keyboard-and-mouse mode: what each controller input does in this game
     /// (PadBindings.buttonNames plus "LS"/"RS" → key, mouse button, key stick or
@@ -708,7 +710,7 @@ final class LibraryModel: ObservableObject {
     @Published var performance = false
     @Published var liveLogs = false
     @Published var fpsMode = 1
-    /// The session's controller mode (LibraryEntry.controllerMode): "keys" or nil.
+    /// The session's controller mode (LibraryEntry.controllerMode): "keys", "dinput", "steam" or nil.
     @Published var controllerMode: String? {
         didSet { if oldValue != controllerMode { applyControllerMode() } }
     }
@@ -1311,6 +1313,9 @@ final class LibraryModel: ObservableObject {
     /// bindings follow the touch layout on screen, so they are rebuilt when the
     /// controls change (TouchControlsModel.controls, observed below).
     func applyControllerMode() {
+        // The Steam Controller is read only while a session uses that mode, so
+        // outside it iOS keeps the controller as its keyboard and mouse.
+        SteamControllerBLE.shared.setWanted(current != nil && controllerMode == "steam")
         guard GamepadInput.keyboardMouseAvailable else { return }
         if current != nil, controllerMode == "keys" {
             GamepadInput.shared.setKeyboardMouse(PadBindings.build(controls: TouchControlsModel.shared.controls, binds: controllerBinds, mouseVertical: padMouseVertical))
@@ -3365,7 +3370,7 @@ struct LibraryDetail: View {
     private func summary(_ page: Page) -> String? {
         switch page {
         case .display: return entry.metalFXUpscale.map { "\(entry.resolution) · MetalFX \($0 == 2 ? "2" : "1.5")×" } ?? entry.resolution
-        case .controls: return entry.controllerMode == "keys" ? "Keyboard and mouse" : entry.controllerMode == "dinput" ? "XInput and DirectInput" : nil
+        case .controls: return ControllerModeChoice.title(entry.controllerMode)
         case .launch: return entry.usesLaunchOptions ? (entry.runsInDesktop ? "Wine desktop" : "Directly") : nil
         case .steam: return entry.startsSteamGameDirectly ? "The game" : "Madeira Dock"
         case .advanced: return Self.configSummary(bcd.configText)   // madeira-bcd: the game's own config file
@@ -3437,6 +3442,9 @@ struct LibraryDetail: View {
                 ControllerModeChoice(mode: $entry.controllerMode)
                 if entry.controllerMode == "dinput" {
                     Text("For older games that read the pad through DirectInput.").font(.caption).foregroundStyle(.secondary)
+                }
+                if entry.controllerMode == "steam" {
+                    Text(ControllerModeChoice.steamNote).font(.caption).foregroundStyle(.secondary)
                 }
                 if entry.controllerMode == "keys" {
                     Text("The pad acts as keyboard and mouse. Change keys in Controller binds.").font(.caption).foregroundStyle(.secondary)
@@ -4030,9 +4038,23 @@ struct ControllerModeChoice: View {
                 Text("Game's own support").tag("")
                 Text("XInput and DirectInput").tag("dinput")
                 Text("Keyboard and mouse").tag("keys")
+                Text("Steam Controller").tag("steam")
             }.pickerStyle(.menu).labelsHidden()
         }
     }
+
+    /// The summary a settings row shows for a mode (nil: the game's own support).
+    static func title(_ mode: String?) -> String? {
+        switch mode {
+        case "keys": return "Keyboard and mouse"
+        case "dinput": return "XInput and DirectInput"
+        case "steam": return "Steam Controller"
+        default: return nil
+        }
+    }
+
+    static let steamNote = "Reads a Steam Controller (2026) over Bluetooth and gives the game an Xbox controller. "
+        + "Pair it in iOS Settings > Bluetooth first; Madeira asks for Bluetooth access the first time."
 }
 
 /// Game details › Launch arguments: one chip per common flag, highlighted when
@@ -4767,6 +4789,8 @@ struct LibraryHUD: View {
                         // ml1240: the DirectInput device exists only from the launch on.
                         Text("XInput and DirectInput applies to the next launch.")
                             .font(.caption).foregroundStyle(.secondary)
+                    } else if model.controllerMode == "steam" {
+                        Text(ControllerModeChoice.steamNote).font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
@@ -5403,6 +5427,53 @@ private struct LaunchFloodShape: Shape {
             if model.cloudNotice != nil || model.error != nil { retract(); return }
             if !model.startingScreen && model.current == nil && model.startingJIT == nil && t > 2.5 { retract(); return }
             if t > 4 { handOff(to: .zero, style: CoverStyle(corner: 14, shadowOpacity: 0, shadowRadius: 0, shadowOffset: .zero), landed: {}); return }
+        }
+    }
+}
+
+/// LOVE games (Balatro) ship a lua51.dll built without LuaJIT's GC64 mode. That
+/// build keeps every Lua object below 2 GB and asks Windows for memory in
+/// [0x10000, 0x80000000); iOS reserves all of the low 4 GB, the request fails
+/// with STATUS_NO_MEMORY, and LuaJIT reads through the null pointer it got back
+/// (lua51.dll+0x55ec0 in Balatro). A GC64 LuaJIT (ci/build-all.sh, st_luajit)
+/// allocates anywhere and exports the same Lua C API LOVE links against, so it
+/// is put in the game's folder before each launch: the original is kept once as
+/// lua51.dll.madeira-orig, and a Steam update that restores it is swapped again.
+/// Precompiled non-GC64 bytecode cannot load in a GC64 VM, but such a game could
+/// not run here at all with its own LuaJIT. MADEIRA_LUAJIT_GC64=0 turns this off.
+enum LuaJITGC64 {
+    static var bundled: URL {
+        Bundle.main.bundleURL.appendingPathComponent("x86_64-vcruntime/lua51-gc64.dll.madeira")
+    }
+
+    static func prepare(_ entry: LibraryEntry) {
+        guard MadeiraConfig.flag("MADEIRA_LUAJIT_GC64") else { return }
+        let fm = FileManager.default
+        guard let ours = fm.contents(atPath: bundled.path) else { return }
+        let drive = LibraryEntry.hostDrive
+        // A Steam start names the install folder; a program start names the executable.
+        var folders = [drive.appendingPathComponent(entry.relativePath)]
+        let launch = drive.appendingPathComponent(entry.launchRelativePath)
+        folders.append(launch.deletingLastPathComponent())
+        for folder in folders {
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: folder.path, isDirectory: &isDir), isDir.boolValue else { continue }
+            let lua = folder.appendingPathComponent("lua51.dll")
+            guard fm.fileExists(atPath: folder.appendingPathComponent("love.dll").path),
+                  let current = fm.contents(atPath: lua.path) else { continue }
+            if current == ours { LogStore.shared.log("[luajit-gc64] \(entry.title): GC64 lua51.dll in place"); return }
+            let original = folder.appendingPathComponent("lua51.dll.madeira-orig")
+            do {
+                try? fm.removeItem(at: original)
+                try fm.moveItem(at: lua, to: original)
+                try ours.write(to: lua)
+                LogStore.shared.log("[luajit-gc64] \(entry.title): game's lua51.dll (\(current.count) bytes) kept as "
+                    + "lua51.dll.madeira-orig, GC64 build (\(ours.count) bytes) installed")
+            } catch {
+                if !fm.fileExists(atPath: lua.path) { try? fm.moveItem(at: original, to: lua) }
+                LogStore.shared.log("[luajit-gc64] \(entry.title): swap failed: \(error.localizedDescription)", level: .error)
+            }
+            return
         }
     }
 }
