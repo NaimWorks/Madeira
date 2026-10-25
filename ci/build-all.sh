@@ -235,8 +235,27 @@ st_llvm() {
     ls "$I"/lib/libLLVM*.a | wc -l
 }
 
+# DXMT's meson build generates these headers (xcrun metal, metallib, xxd -i); build.sh reads
+# them from build/dxmt-ios/shader-headers, which is git-ignored, so generate them here.
+dxmt_shader_headers() {
+    local H=build/dxmt-ios/shader-headers T; T=$(mktemp -d)
+    mkdir -p "$H"
+    xcrun -sdk macosx metal -v >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+    for s in air_msad air_samplepos air_tessellation; do
+        xcrun -sdk macosx metal -std=metal3.1 --target=air64-apple-macos14.0 \
+            -o "$T/$s.air" -c "dxmt/src/airconv/shaders/$s.metal"
+        (cd "$T" && xxd -n "$s" -i "$s.air" "$R/$H/$s.h")
+    done
+    xcrun -sdk macosx metal -std=metal3.1 --target=air64-apple-macos14.0 \
+        -o "$T/dxmt_command.air" -c dxmt/src/dxmt/dxmt_command.metal
+    xcrun -sdk macosx metallib -o "$T/dxmt_command.metallib" "$T/dxmt_command.air"
+    (cd "$T" && xxd -n dxmt_command -i dxmt_command.metallib "$R/$H/dxmt_command.h")
+    ls -la "$H"
+}
+
 st_dxmt() {
     local B=build/dxmt-ios
+    dxmt_shader_headers
     # The script keeps each compiler message in obj/<name>.err and prints only FAILED.
     if ! bash "$B/build.sh"; then
         for e in "$B"/obj/*.err; do [ -f "${e%.err}.o" ] || { echo "== ${e##*/}"; head -n 60 "$e"; }; done
@@ -327,7 +346,7 @@ key win32u wine build/win32u-unix build/ntdll-unix build/freetype-ios @wine_maco
 OUTS[win32u]="app/Madeira/libwin32u_unix.a"; SUBS[win32u]="wine"
 key llvm =$LLVM_COMMIT %st_llvm
 OUTS[llvm]="toolchains/llvm-project/llvm/include toolchains/llvm-ios-build/include toolchains/llvm-ios-build/lib/libLLVM*.a"
-key dxmt dxmt build/dxmt-ios build/madeira-d3d12 madeira-d3d12 app/Madeira/d3d12 @llvm %st_dxmt
+key dxmt dxmt build/dxmt-ios build/madeira-d3d12 madeira-d3d12 app/Madeira/d3d12 @llvm %st_dxmt %dxmt_shader_headers
 OUTS[dxmt]="app/Madeira/libdxmt_combined.a"; SUBS[dxmt]="dxmt"
 key rppairing build/rppairing-ios %st_rppairing
 OUTS[rppairing]="app/Madeira/libmadeira_rppairing.a app/Madeira/legal/LICENSES-rppairing-crates.txt"
