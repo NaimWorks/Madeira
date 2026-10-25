@@ -12,13 +12,15 @@ SHIMS_DIR="$REPO_ROOT/build/ntdll-unix/shims"
 OBJ_DIR="$BUILD_DIR/obj"
 mkdir -p "$OBJ_DIR"
 
-# Copy the base library if we don't have one yet
+# Copy the base library if we don't have one yet. A clean checkout has none (the archive is
+# a build output, never committed): it is then built from the submodule below, once
+# CC_FLAGS and compile_one exist.
+NEED_BASE=0
 if [ ! -f "$OBJ_DIR/libwineserver.a" ]; then
     if [ -f "$APP_LIB" ]; then
         cp "$APP_LIB" "$OBJ_DIR/libwineserver.a"
     else
-        echo "ERROR: No base libwineserver.a found"
-        exit 1
+        NEED_BASE=1
     fi
 fi
 
@@ -113,6 +115,27 @@ PATCHED_FILES=(
     "hidparse_ios:$REPO_ROOT/build/hidpad/hidparse_ios.c:hidparse_ios.o"
     "storage_device_ios:storage_device_ios.c:storage_device_ios.o"
 )
+
+# The base archive: Wine's own server objects that PATCHED_FILES does not replace, compiled
+# with the same flags. Before this, a clean checkout stopped at "No base libwineserver.a".
+if [ "$NEED_BASE" = 1 ]; then
+    echo "=== No base libwineserver.a: building it from $WINE_SRC/server ==="
+    replaced=" "
+    for entry in "${PATCHED_FILES[@]}"; do replaced+="${entry##*:} "; done
+    mkdir -p "$OBJ_DIR/base"
+    base_failed=""
+    for src in "$WINE_SRC"/server/*.c; do
+        name=$(basename "$src" .c)
+        [[ "$replaced" == *" $name.o "* ]] && continue
+        if xcrun -sdk iphoneos clang "${CC_FLAGS[@]}" -c "$src" -o "$OBJ_DIR/base/$name.o" 2>"$OBJ_DIR/err-base-$name.txt"; then
+            echo "  base $name OK"
+        else
+            echo "  base $name FAILED"; sed -n 1,20p "$OBJ_DIR/err-base-$name.txt"; base_failed+=" $name"
+        fi
+    done
+    xcrun -sdk iphoneos ar rcs "$OBJ_DIR/libwineserver.a" "$OBJ_DIR"/base/*.o
+    echo "base archive: $(ls "$OBJ_DIR"/base/*.o | wc -l | tr -d ' ') objects${base_failed:+, failed:$base_failed}"
+fi
 
 echo "=== Building kill wrapper (without kill macro) ==="
 echo -n "  wineserver_ios_kill... "
