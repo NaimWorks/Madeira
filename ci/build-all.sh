@@ -166,7 +166,13 @@ st_freetype() {
 
 st_gnutls() { brew_need autoconf automake libtool pkg-config; bash build/gnutls-ios/build.sh; }
 st_ffmpeg() { brew_need pkg-config; bash build/ffmpeg/build.sh; }
-st_fex()    { brew_need cmake ninja ccache; bash build/fex-ios/build.sh; }
+st_fex() {
+    brew_need cmake ninja ccache
+    # FEX's configure runs Scripts/aarch64_fit_native.py, which imports packaging; without it
+    # the script fails and CMake stops at "string sub-command STRIP requires two arguments".
+    python3 -c 'import packaging' 2>/dev/null || python3 -m pip install -q --break-system-packages packaging
+    bash build/fex-ios/build.sh
+}
 
 st_wine_macos() {
     # Host-configured tree whose config.h and generated headers the unix-side builds read.
