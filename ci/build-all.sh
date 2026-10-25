@@ -123,7 +123,11 @@ run() {   # run <stage> <needs...> -- <command...>
         DONE[$name]=ok; echo "ok $name (restored ${KEY[$name]}, $((SECONDS - t0))s)"; return
     fi
     echo "::group::$name"
-    if ( set -e; cd "$R"; [ -n "${SUBS[$name]:-}" ] && sub_need ${SUBS[$name]}; "$@" ) > "$LOGS/$name.log" 2>&1; then
+    # Not "if ( ... ); then": bash ignores set -e inside a condition, so a stage would then
+    # fail only when its last command did (a failed link once passed for its final ls).
+    ( set -e; cd "$R"; if [ -n "${SUBS[$name]:-}" ]; then sub_need ${SUBS[$name]}; fi; "$@" ) > "$LOGS/$name.log" 2>&1
+    local rc=$?
+    if [ $rc -eq 0 ]; then
         DONE[$name]=ok; echo "ok $name ($((SECONDS - t0))s)"
         [ -n "${OUTS[$name]:-}" ] && store "$name" >> "$LOGS/$name.log" 2>&1
     else
@@ -263,7 +267,7 @@ st_luajit() {
     PATH="$TC:$PATH" make -C "$S/src" -j"$JOBS" HOST_CC="xcrun clang" CROSS=x86_64-w64-mingw32- \
         TARGET_SYS=Windows BUILDMODE=dynamic TARGET_LDFLAGS="-static-libgcc"
     "$TC/llvm-readobj" --coff-imports "$S/src/lua51.dll" | grep -E "Name:" | sort -u
-    strings "$S/src/lua51.dll" | grep -m1 "LuaJIT 2.1"
+    { strings "$S/src/lua51.dll" | grep -m1 "LuaJIT 2.1"; } || true
     cp "$S/src/lua51.dll" app/Madeira/x86_64-vcruntime/lua51-gc64.dll.madeira
     ls -la app/Madeira/x86_64-vcruntime/lua51-gc64.dll.madeira
 }
@@ -274,7 +278,8 @@ st_app() {
         -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$DD" \
         CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
         build | tee "$LOGS/xcodebuild-raw.log" | xcbeautify --quiet
-    ls -d "$DD/Build/Products/Debug-iphoneos/Madeira.app"
+    # The bundle folder exists even after a failed link; the binaries must too.
+    ls -la "$DD/Build/Products/Debug-iphoneos/Madeira.app/Madeira" "$DD/Build/Products/Debug-iphoneos/Madeira.app/Madeira.debug.dylib"
 }
 
 st_ipa() {
