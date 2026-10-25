@@ -236,8 +236,13 @@ st_llvm() {
 }
 
 st_dxmt() {
-    bash build/dxmt-ios/build.sh
     local B=build/dxmt-ios
+    # The script keeps each compiler message in obj/<name>.err and prints only FAILED.
+    if ! bash "$B/build.sh"; then
+        for e in "$B"/obj/*.err; do [ -f "${e%.err}.o" ] || { echo "== ${e##*/}"; head -n 60 "$e"; }; done
+        return 1
+    fi
+    [ -f "$B/libdxmt_unix.a" ]
     # The script only refreshes libdxmt_combined.a; create it the first time: the unix
     # side plus every LLVM archive (airconv's bitcode reader/writer and their deps).
     xcrun -sdk iphoneos libtool -static -o "$B/libdxmt_combined.a" "$B/libdxmt_unix.a" \
