@@ -66,7 +66,12 @@ esac
 #   netprofm
 #       the Network List Manager, for services a launcher starts in a game
 #       session
-GAME_MODULES="msvcr70 msvcr71 msvcr80 msvcr90 msvcr100 msvcrt20 msvcrt40 msvcirt
+#   wintypes
+#       the apiset schema maps api-ms-win-core-winrt-robuffer-l1-1-0 to it, and
+#       Unity IL2CPP builds import that from GameAssembly.dll (Slime Rancher 2,
+#       Cat Mail Co): without wintypes.dll the import fails with c0000135 and
+#       Unity sits on an invisible "Fatal error" box before the first frame
+GAME_MODULES="wintypes msvcr70 msvcr71 msvcr80 msvcr90 msvcr100 msvcrt20 msvcrt40 msvcirt
     msvcp60 msvcp70 msvcp71 msvcp80 msvcp90 msvcp100 msvcp120
     vcomp vcomp90 vcomp100 vcomp110 vcomp120 vcomp140
     d3d10 d3d10_1 avifil32 msvfw32
