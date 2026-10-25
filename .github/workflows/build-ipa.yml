@@ -1,0 +1,103 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'tests/**', 'research/**']
+  workflow_dispatch:
+    inputs:
+      stages:
+        description: 'Stages to run (space separated; empty = all)'
+        required: false
+        default: ''
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Select Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$X" ] && sudo xcode-select -s "$X"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Tools
+        run: |
+          brew install bash bison flex ccache ninja meson cmake llvm autoconf automake libtool pkg-config ldid xcbeautify || true
+          rustup target add aarch64-apple-ios || true
+
+      - name: Restore LLVM for iOS
+        id: llvm-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            toolchains/llvm-project/llvm/include
+            toolchains/llvm-ios-build/include
+            toolchains/llvm-ios-build/lib/*.a
+          key: llvm-ios-8dfdcc7b-v1
+
+      - name: Restore llvm-mingw
+        id: mingw-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: toolchains/llvm-mingw-20260421-ucrt-macos-universal
+          key: llvm-mingw-20260421-v1
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/ccache
+          key: ccache-${{ github.sha }}
+          restore-keys: ccache-
+
+      - name: Build
+        env:
+          LOGS: ${{ github.workspace }}/ci-logs
+          OUT: ${{ github.workspace }}/ci-out
+        run: |
+          "$(brew --prefix)/bin/bash" ci/build-all.sh ${{ github.event.inputs.stages }}
+
+      # Saved even when a later stage fails, so the hours-long LLVM build is done once.
+      - name: Save LLVM for iOS
+        if: always() && steps.llvm-cache.outputs.cache-hit != 'true' && hashFiles('toolchains/llvm-ios-build/lib/libLLVMCore.a') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains/llvm-project/llvm/include
+            toolchains/llvm-ios-build/include
+            toolchains/llvm-ios-build/lib/*.a
+          key: llvm-ios-8dfdcc7b-v1
+
+      - name: Save llvm-mingw
+        if: always() && steps.mingw-cache.outputs.cache-hit != 'true' && hashFiles('toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/clang') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: toolchains/llvm-mingw-20260421-ucrt-macos-universal
+          key: llvm-mingw-20260421-v1
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: ci-logs
+
+      - name: Upload IPA
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa
+          path: ci-out/*.ipa
+          if-no-files-found: ignore
