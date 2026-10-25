@@ -11,81 +11,68 @@ on:
         required: false
         default: ''
 
+# Runs queue rather than cancel: a cancelled run would throw away stages it already built.
 concurrency:
   group: build-ipa-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: macos-26
     timeout-minutes: 360
     steps:
+      # Submodules are fetched by ci/build-all.sh only for the stages that rebuild.
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
           fetch-depth: 1
 
       - name: Select Xcode
         run: |
-          ls -d /Applications/Xcode*.app
           X=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
           [ -n "$X" ] && sudo xcode-select -s "$X"
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
 
       - name: Tools
-        run: |
-          brew install bash bison flex ccache ninja meson cmake llvm autoconf automake libtool pkg-config ldid xcbeautify || true
-          rustup target add aarch64-apple-ios || true
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install bash zstd ldid xcbeautify
 
-      - name: Restore LLVM for iOS
-        id: llvm-cache
+      # One cache for every stage's outputs (ci/build-all.sh keys each stage itself). The
+      # newest entry is restored; a run saves a new one only when a stage was rebuilt.
+      - name: Restore stage cache
         uses: actions/cache/restore@v4
         with:
-          path: |
-            toolchains/llvm-project/llvm/include
-            toolchains/llvm-ios-build/include
-            toolchains/llvm-ios-build/lib/*.a
-          key: llvm-ios-8dfdcc7b-v1
+          path: .stage-cache
+          key: stages-${{ github.run_id }}
+          restore-keys: stages-
 
-      - name: Restore llvm-mingw
-        id: mingw-cache
+      - name: Restore ccache
         uses: actions/cache/restore@v4
-        with:
-          path: toolchains/llvm-mingw-20260421-ucrt-macos-universal
-          key: llvm-mingw-20260421-v1
-
-      - name: Cache ccache
-        uses: actions/cache@v4
         with:
           path: ~/Library/Caches/ccache
-          key: ccache-${{ github.sha }}
+          key: ccache-${{ github.run_id }}
           restore-keys: ccache-
 
       - name: Build
         env:
           LOGS: ${{ github.workspace }}/ci-logs
           OUT: ${{ github.workspace }}/ci-out
+          CACHE: ${{ github.workspace }}/.stage-cache
         run: |
           "$(brew --prefix)/bin/bash" ci/build-all.sh ${{ github.event.inputs.stages }}
 
-      # Saved even when a later stage fails, so the hours-long LLVM build is done once.
-      - name: Save LLVM for iOS
-        if: always() && steps.llvm-cache.outputs.cache-hit != 'true' && hashFiles('toolchains/llvm-ios-build/lib/libLLVMCore.a') != ''
+      - name: Save stage cache
+        if: always() && hashFiles('.stage-cache/changed.marker') != ''
         uses: actions/cache/save@v4
         with:
-          path: |
-            toolchains/llvm-project/llvm/include
-            toolchains/llvm-ios-build/include
-            toolchains/llvm-ios-build/lib/*.a
-          key: llvm-ios-8dfdcc7b-v1
+          path: .stage-cache
+          key: stages-${{ github.run_id }}
 
-      - name: Save llvm-mingw
-        if: always() && steps.mingw-cache.outputs.cache-hit != 'true' && hashFiles('toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/clang') != ''
+      - name: Save ccache
+        if: always() && hashFiles('.stage-cache/changed.marker') != ''
         uses: actions/cache/save@v4
         with:
-          path: toolchains/llvm-mingw-20260421-ucrt-macos-universal
-          key: llvm-mingw-20260421-v1
+          path: ~/Library/Caches/ccache
+          key: ccache-${{ github.run_id }}
 
       - name: Upload logs
         if: always()
